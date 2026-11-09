@@ -16,7 +16,7 @@ load_dotenv()
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv('BOT_TOKEN')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_KEY')
-MODEL_ID = 'deepseek/deepseek-chat-v3-0324:free'
+MODEL_ID = 'meta-llama/llama-3.3-70b-instruct:free'
 
 bot = telebot.TeleBot(TOKEN)
 
