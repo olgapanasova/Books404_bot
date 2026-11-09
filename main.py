@@ -1,13 +1,17 @@
 import random
 import os
-import telebot
-import requests
+import time
+import html
 import json
 import logging
+
+import requests
+import telebot
 from telebot import types
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
 
-# Включаем вывод логов
 logger = telebot.logger
 telebot.logger.setLevel(logging.INFO)
 
@@ -15,10 +19,24 @@ load_dotenv()
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv('BOT_TOKEN')
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_KEY')
-MODEL_ID = 'meta-llama/llama-3.3-70b-instruct:free'
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')  # необязательно
+
+# Модели пробуются по очереди. Если одна перегружена (503) или упёрлась
+# в лимит (429) — бот сразу переходит к следующей.
+# Список можно переопределить в .env: GEMINI_MODELS=модель1,модель2
+GEMINI_MODELS = [m.strip() for m in os.getenv(
+    'GEMINI_MODELS',
+    'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash'
+).split(',') if m.strip()]
+
+# Бесплатные модели OpenRouter. openrouter/free сам выбирает свободную модель.
+OPENROUTER_MODELS = [m.strip() for m in os.getenv(
+    'OPENROUTER_MODELS', 'openrouter/free'
+).split(',') if m.strip()]
 
 bot = telebot.TeleBot(TOKEN)
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # --- ПОЛНЫЙ СПИСОК ЦИТАТ ---
 QUOTES = [
@@ -188,43 +206,114 @@ BOOKS_DATA = {
     }
 }
 
-# --- ФУНКЦИЯ ЗАПРОСА К ИИ ---
-def ask_ai(user_text):
-    books_list = "\n".join([f"- {name}" for name in BOOKS_DATA.keys()])
-    system_prompt = (
-        f"Ты — книжный терапевт. Пользователь описывает свою ситуацию. Выбери РОВНО ОДНУ книгу из списка ниже, которая лучше всего подходит. "
-        f"Ответь СТРОГО в формате JSON без markdown-разметки: {{\"book_title\": \"Точное название книги из списка\", \"reason\": \"Почему она подходит (1-2 предложения)\"}}.\n"
+# --- ИИ ---
+def build_prompt(user_text):
+    books_list = "\n".join(f"- {name}" for name in BOOKS_DATA)
+    return (
+        f"Ты — книжный терапевт. Пользователь описывает свою ситуацию: \"{user_text}\"\n"
+        "Выбери РОВНО ОДНУ книгу из списка ниже, которая лучше всего подходит.\n"
+        "Верни ответ СТРОГО в виде JSON с двумя ключами:\n"
+        "\"book_title\": точное название книги из списка (символ в символ),\n"
+        "\"reason\": почему она подходит (1-2 предложения).\n\n"
         f"Список книг:\n{books_list}"
     )
-    
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    data = {
-        "model": MODEL_ID,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text}
-        ]
-    }
-    
-    try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data, timeout=60)
-        result = response.json()
-        
-        if 'choices' not in result:
-            logger.error(f"Ошибка API: {result}")
-            return None
-            
-        ai_text = result["choices"][0]["message"]["content"]
-        ai_text = ai_text.replace('```json', '').replace('```', '').strip()
-        start = ai_text.find('{')
-        end = ai_text.rfind('}') + 1
-        if start != -1 and end != 0:
-            ai_text = ai_text[start:end]
-            
-        return json.loads(ai_text)
-    except Exception as e:
-        logger.error(f"Ошибка ИИ: {e}")
+
+
+def parse_ai_json(text):
+    """Достаёт JSON из ответа модели и проверяет, что книга есть в базе."""
+    if not text:
         return None
+    text = text.replace('```json', '').replace('```', '').strip()
+    start, end = text.find('{'), text.rfind('}') + 1
+    if start == -1 or end == 0:
+        return None
+    try:
+        data = json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return None
+
+    title = str(data.get('book_title', '')).strip().strip('«»"')
+    if title not in BOOKS_DATA:
+        # модели иногда немного искажают название — ищем ближайшее совпадение
+        low = title.lower()
+        title = next((b for b in BOOKS_DATA
+                      if low and (low in b.lower() or b.lower().split(' (')[0] in low)), None)
+    if not title:
+        return None
+    return {'book_title': title, 'reason': str(data.get('reason', '')).strip()}
+
+
+def is_temporary_error(err_text):
+    return any(code in err_text for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'overloaded'))
+
+
+def ask_gemini(prompt):
+    if not ai_client:
+        return None
+    for model in GEMINI_MODELS:
+        for attempt in range(2):  # одна повторная попытка на модель
+            try:
+                response = ai_client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type='application/json',
+                        temperature=0.4,
+                    ),
+                )
+                result = parse_ai_json(response.text)
+                if result:
+                    logger.info(f"Ответ получен от Gemini ({model})")
+                    return result
+                logger.warning(f"Gemini ({model}) вернул непонятный ответ: {response.text!r}")
+                break
+            except Exception as e:
+                err = str(e)
+                logger.warning(f"Gemini ({model}), попытка {attempt + 1}: {err[:200]}")
+                if '404' in err or 'NOT_FOUND' in err:
+                    break  # такой модели нет — сразу к следующей
+                if is_temporary_error(err) and attempt == 0:
+                    time.sleep(2)
+                    continue
+                break
+    return None
+
+
+def ask_openrouter(prompt):
+    if not OPENROUTER_API_KEY:
+        return None
+    for model in OPENROUTER_MODELS:
+        try:
+            r = requests.post(
+                'https://openrouter.ai/api/v1/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'model': model,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'temperature': 0.4,
+                },
+                timeout=60,
+            )
+            if r.status_code != 200:
+                logger.warning(f"OpenRouter ({model}): {r.status_code} {r.text[:200]}")
+                continue
+            content = r.json()['choices'][0]['message'].get('content') or ''
+            result = parse_ai_json(content)
+            if result:
+                logger.info(f"Ответ получен от OpenRouter ({model})")
+                return result
+            logger.warning(f"OpenRouter ({model}) вернул непонятный ответ: {content[:200]!r}")
+        except Exception as e:
+            logger.warning(f"OpenRouter ({model}): {e}")
+    return None
+
+
+def ask_ai(user_text):
+    prompt = build_prompt(user_text)
+    return ask_gemini(prompt) or ask_openrouter(prompt)
 
 # --- КЛАВИАТУРЫ ---
 def get_main_menu():
@@ -254,87 +343,92 @@ def get_quote_markup():
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(
-        message.chat.id, 
-        "<b>Приветствую вас. Я бот Error 404.</b>\n\nТыкайте кнопки ниже, и вы поймете принцип моей работы. Если нужна подробная инструкция, нажмите «Как это работает».", 
+        message.chat.id,
+        "<b>Приветствую вас. Я бот Error 404.</b>\n\nТыкайте кнопки ниже, и вы поймете принцип моей работы. Если нужна подробная инструкция, нажмите «Как это работает».",
         reply_markup=get_main_menu(),
         parse_mode='HTML'
     )
 
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_inline(call):
+    bot.answer_callback_query(call.id)  # убирает «часики» на кнопке
+    chat_id = call.message.chat.id
     if call.data == 'books':
-        bot.send_message(call.message.chat.id, "Опиши в двух словах, что тебя беспокоит. Я проанализирую это с помощью ИИ.")
+        bot.send_message(chat_id, "Опиши в двух словах, что тебя беспокоит. Я проанализирую это с помощью ИИ.")
     elif call.data == 'back':
-        bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=get_main_menu())
+        bot.send_message(chat_id, "Главное меню:", reply_markup=get_main_menu())
     elif call.data == 'random':
         book = random.choice(list(BOOKS_DATA.keys()))
-        bot.send_message(call.message.chat.id, f"Твой случайный выбор:\n\n<b>{book}</b>", parse_mode='HTML', reply_markup=get_back_button())
+        bot.send_message(chat_id, f"Твой случайный выбор:\n\n<b>{html.escape(book)}</b>", parse_mode='HTML', reply_markup=get_back_button())
     elif call.data in ['quote', 'more_quote']:
         quote = random.choice(QUOTES)
-        msg = f"<i>«{quote['text']}»</i>\n\n— <b>{quote['author']}</b>"
-        bot.send_message(call.message.chat.id, msg, parse_mode='HTML', reply_markup=get_quote_markup())
+        msg = f"<i>«{html.escape(quote['text'])}»</i>\n\n— <b>{html.escape(quote['author'])}</b>"
+        bot.send_message(chat_id, msg, parse_mode='HTML', reply_markup=get_quote_markup())
     elif call.data == 'catalog':
         catalog_text = "<b>Каталог доступных книг:</b>\n\n"
-        for b in BOOKS_DATA.keys():
-            catalog_text += f"- {b}\n"
-        bot.send_message(call.message.chat.id, catalog_text, parse_mode='HTML', reply_markup=get_back_button())
+        for b in BOOKS_DATA:
+            catalog_text += f"- {html.escape(b)}\n"
+        bot.send_message(chat_id, catalog_text, parse_mode='HTML', reply_markup=get_back_button())
     elif call.data == 'how':
         how_text = "<b>Как это работает:</b>\n\nВы описываете свое состояние, а искусственный интеллект анализирует ваш запрос и подбирает книгу из нашей базы."
-        bot.send_message(call.message.chat.id, how_text, parse_mode='HTML', reply_markup=get_back_button())
+        bot.send_message(chat_id, how_text, parse_mode='HTML', reply_markup=get_back_button())
     elif call.data == 'about':
         about_text = "<b>О проекте Error 404</b>\n\nСоздано @Panasova_0 с любовью к литературе и психологии."
-        bot.send_message(call.message.chat.id, about_text, parse_mode='HTML', reply_markup=get_back_button())
+        bot.send_message(chat_id, about_text, parse_mode='HTML', reply_markup=get_back_button())
+
+
+def edit_status(message, status_msg, text):
+    bot.edit_message_text(text, chat_id=message.chat.id, message_id=status_msg.message_id,
+                          parse_mode='HTML', reply_markup=get_back_button())
+
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     user_text = message.text.lower()
     status_msg = bot.send_message(message.chat.id, "ИИ анализирует твой запрос...")
-    
-    # 1. Сначала пробуем ИИ
-    ai_result = ask_ai(user_text)
-    
-    if ai_result and ai_result.get('book_title') in BOOKS_DATA:
+
+    # 1. ИИ: сначала Gemini (несколько моделей по очереди), потом OpenRouter
+    ai_result = ask_ai(message.text)
+
+    if ai_result:
         book = ai_result['book_title']
-        reason = ai_result['reason']
         data = BOOKS_DATA[book]
-        
-        msg = f"<b>ИИ рекомендует: {book}</b>\n\n"
-        msg += f"Почему: {reason}\n\n"
-        msg += f"<i>Внимание: {data['warn']}</i>"
-        
-        bot.edit_message_text(msg, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode='HTML', reply_markup=get_back_button())
+        msg = f"<b>ИИ рекомендует: {html.escape(book)}</b>\n\n"
+        if ai_result['reason']:
+            msg += f"Почему: {html.escape(ai_result['reason'])}\n\n"
+        msg += f"<i>Внимание: {html.escape(data['warn'])}</i>"
+        edit_status(message, status_msg, msg)
         return
 
-    # 2. Если ИИ упал или не нашел книгу, работает старый поиск по тегам
+    # 2. Резервный поиск по тегам, если все ИИ недоступны
     logger.info("ИИ не справился, переключаюсь на теги...")
     wants_light = any(word in user_text for word in ["легк", "смешн", "романтик", "весел", "уютн", "отвлечься"])
-    
-    scores = {book: 0 for book in BOOKS_DATA}
-    matched_tags_global = set()
 
+    scores = {book: 0 for book in BOOKS_DATA}
     for book, data in BOOKS_DATA.items():
         if wants_light and data.get("level", 3) >= 3:
             continue
         for tag in data["tags"]:
-            if tag in user_text:
+            if tag.replace('_', ' ') in user_text or tag in user_text:
                 scores[book] += 1
-                matched_tags_global.add(tag)
 
     max_score = max(scores.values())
-
     if max_score == 0:
-        msg = "Я тебя услышал. Но в моей базе пока нет книги, которая идеально подходит. Попробуй описать иначе."
-        bot.edit_message_text(msg, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode='HTML', reply_markup=get_back_button())
-    else:
-        best_books = [book for book, score in scores.items() if score == max_score]
-        best_book = best_books[0]
-        data = BOOKS_DATA[best_book]
-        
-        msg = f"<b>Твоя ситуация похожа на книгу «{best_book}».</b>\n\n"
-        msg += f"О чем она: {data['desc']}\n\n"
-        msg += f"<i>Внимание: {data['warn']}</i>"
-        
-        bot.edit_message_text(msg, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode='HTML', reply_markup=get_back_button())
+        edit_status(message, status_msg,
+                    "Я тебя услышал. Но в моей базе пока нет книги, которая идеально подходит. Попробуй описать иначе.")
+        return
 
-print("Бот с ИИ запущен...")
-bot.infinity_polling(timeout=120, long_polling_timeout=90)
+    best_book = random.choice([b for b, s in scores.items() if s == max_score])
+    data = BOOKS_DATA[best_book]
+    msg = f"<b>Твоя ситуация похожа на книгу «{html.escape(best_book)}».</b>\n\n"
+    msg += f"О чем она: {html.escape(data['desc'])}\n\n"
+    msg += f"<i>Внимание: {html.escape(data['warn'])}</i>"
+    edit_status(message, status_msg, msg)
+
+
+if __name__ == '__main__':
+    logger.info(f"Gemini модели: {GEMINI_MODELS}")
+    logger.info(f"OpenRouter: {'включён ' + str(OPENROUTER_MODELS) if OPENROUTER_API_KEY else 'выключен (нет OPENROUTER_API_KEY)'}")
+    print("Бот запущен...")
+    bot.infinity_polling(timeout=120, long_polling_timeout=90)
